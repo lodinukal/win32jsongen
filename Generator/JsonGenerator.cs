@@ -308,6 +308,7 @@ namespace JsonWin32Generator
 
             CustomAttr.Guid? optionalGuidValue = null;
             CustomAttr.ProperyKey? optionalPropertyKey = null;
+            CustomAttr.Constant? optionalConstant = null;
 
             // TODO: what is fieldDef.GetMarshallingDescriptor?
             foreach (CustomAttributeHandle attrHandle in fieldDef.GetCustomAttributes())
@@ -333,8 +334,17 @@ namespace JsonWin32Generator
                 {
                     // nothing
                 }
+                else if (attr is CustomAttr.Constant c)
+                {
+                    optionalConstant = c;
+                }
+                else if (attr is CustomAttr.Documentation)
+                {
+                    // nothing
+                }
                 else
                 {
+                    Console.WriteLine("{0} has unknown attribute {1}", name, attr);
                     Violation.Data();
                 }
             }
@@ -354,6 +364,14 @@ namespace JsonWin32Generator
                 Enforce.Data(!hasValue);
                 writer.WriteLine(",\"ValueType\":\"PropertyKey\"");
                 writer.WriteLine(",\"Value\":{{\"Fmtid\":\"{0}\",\"Pid\":{1}}}", optionalPropertyKey.Fmtid, optionalPropertyKey.Pid);
+            }
+            else if (optionalConstant != null)
+            {
+                Enforce.Data(!hasValue);
+                var trimmed = optionalConstant.Value[1..optionalConstant.Value.IndexOf("}", StringComparison.Ordinal)];
+                var pid = optionalConstant.Value[(optionalConstant.Value.IndexOf("}", StringComparison.Ordinal) + 3)..];
+                writer.WriteLine(",\"ValueType\":\"PropertyKey\"");
+                writer.WriteLine(",\"Value\":{{\"Fmtid\":\"{0}\",\"Pid\":{1}}}", trimmed, pid);
             }
             else
             {
@@ -389,6 +407,7 @@ namespace JsonWin32Generator
             Enforce.Data(typeInfo.Def.BaseType.IsNil == attrs.IsAbstract);
 
             // TODO: do something with these attributes (they are no longer used)
+            string? documentation = null;
             bool isObselete = false;
             string? guid = null;
             string? freeFuncAttr = null;
@@ -400,6 +419,8 @@ namespace JsonWin32Generator
             bool scopedEnum = false;
             long? invalidHandleValue = null;
             bool isAgile = false;
+            string? structSizeField = null;
+            bool isMetadataTypedef = false;
 
             foreach (CustomAttributeHandle attrHandle in typeInfo.Def.GetCustomAttributes())
             {
@@ -458,8 +479,30 @@ namespace JsonWin32Generator
                 {
                     isObselete = true;
                 }
+                else if (attr is CustomAttr.Documentation documentationAttr)
+                {
+                    Enforce.Data(documentation == null);
+                    documentation = documentationAttr.Value;
+                }
+                else if (attr is CustomAttr.Ansi)
+                {
+                    // nothing
+                }
+                else if (attr is CustomAttr.Unicode)
+                {
+                    // nothing
+                }
+                else if (attr is CustomAttr.StructSizeField ssf)
+                {
+                    structSizeField = ssf.Field;
+                }
+                else if (attr is CustomAttr.MetadataTypedef)
+                {
+                    isMetadataTypedef = true;
+                }
                 else
                 {
+                    Console.WriteLine("{0} has unknown attribute {1}", typeInfo.Fqn, attr);
                     Enforce.Data(false);
                 }
             }
@@ -471,6 +514,24 @@ namespace JsonWin32Generator
                 Enforce.Data(scopedEnum == false);
                 Enforce.Data(typeInfo.TypeRefTargetKind == TypeGenInfo.TypeRefKind.Default);
                 writer.WriteLine(",\"Kind\":\"NativeTypedef\"");
+                writer.WriteLine(",\"AlsoUsableFor\":{0}", optionalAlsoUsableFor.JsonString());
+                Enforce.Data(attrs.Layout == TypeLayoutKind.Sequential);
+                Enforce.Data(typeInfo.Def.GetFields().Count == 1);
+                FieldDefinition targetDef = this.mr.GetFieldDefinition(typeInfo.Def.GetFields().First());
+                string targetDefJson = targetDef.DecodeSignature(this.typeRefDecoder, null).ToJson();
+                writer.WriteLine(",\"Def\":{0}", targetDefJson);
+                Enforce.Data(guid == null);
+                writer.WriteLine(",\"FreeFunc\":{0}", freeFuncAttr.JsonString());
+                Enforce.Data(typeInfo.Def.GetMethods().Count == 0);
+                Enforce.Data(typeInfo.NestedTypeCount == 0);
+                writer.WriteLine(",\"InvalidHandleValue\":{0}", (invalidHandleValue != null) ? invalidHandleValue : "null");
+                Enforce.Data(!isAgile);
+            }
+            else if (isMetadataTypedef)
+            {
+                Enforce.Data(scopedEnum == false);
+                Enforce.Data(typeInfo.TypeRefTargetKind == TypeGenInfo.TypeRefKind.Default);
+                writer.WriteLine(",\"Kind\":\"MetadataTypedef\"");
                 writer.WriteLine(",\"AlsoUsableFor\":{0}", optionalAlsoUsableFor.JsonString());
                 Enforce.Data(attrs.Layout == TypeLayoutKind.Sequential);
                 Enforce.Data(typeInfo.Def.GetFields().Count == 1);
@@ -507,6 +568,7 @@ namespace JsonWin32Generator
             }
             else if (typeInfo.BaseTypeName == new NamespaceAndName("System", "ValueType"))
             {
+                Console.WriteLine("DEBUG: {0} {1}", typeInfo.Fqn, isNativeTypedef);
                 Enforce.Data(scopedEnum == false);
                 Enforce.Data(typeInfo.TypeRefTargetKind == TypeGenInfo.TypeRefKind.Default);
                 Enforce.Data(freeFuncAttr == null);
@@ -720,8 +782,21 @@ namespace JsonWin32Generator
                     {
                         jsonAttributes.Add("\"Obselete\"");
                     }
+                    else if (attr is CustomAttr.FlexibleArray)
+                    {
+                        // nothing
+                    }
+                    else if (attr is CustomAttr.AssociatedEnum)
+                    {
+                        // nothing
+                    }
+                    else if (attr is CustomAttr.NativeBitfield)
+                    {
+                        // TODO: add native bit field
+                    }
                     else
                     {
+                        Console.WriteLine("{0} has unknown attribute {1}", fieldName, attr);
                         Violation.Data();
                     }
                 }
@@ -859,6 +934,7 @@ namespace JsonWin32Generator
             Enforce.Data(decodedAttrs.HideBySig);
             Enforce.Data(!decodedAttrs.CheckAccessOnOverride);
 
+            string? documentation = null;
             string? optionalSupportedOsPlatform = null;
             Arch[] archLimits = Array.Empty<Arch>();
             bool doesNotReturn = false;
@@ -892,8 +968,22 @@ namespace JsonWin32Generator
                 {
                     isObselete = true;
                 }
+                else if (attr is CustomAttr.Documentation documentationAttr)
+                {
+                    Enforce.Data(documentation is null);
+                    documentation = documentationAttr.Value;
+                }
+                else if (attr is CustomAttr.Ansi)
+                {
+                    // nothing
+                }
+                else if (attr is CustomAttr.Unicode)
+                {
+                    // nothing
+                }
                 else
                 {
+                    Console.WriteLine("{0} has unknown attribute {1}", funcName, attr);
                     Violation.Data();
                 }
             }
@@ -908,7 +998,7 @@ namespace JsonWin32Generator
             {
                 Enforce.Data(methodImportAttrs.ExactSpelling);
                 // Enforce.Data(methodImportAttrs.CallConv == CallConv.Winapi);
-                Enforce.Data(this.mr.GetString(methodImport.Name) == funcName);
+                // Enforce.Data(this.mr.GetString(methodImport.Name) == methodImportAttrs);
             }
             else
             {
@@ -939,6 +1029,7 @@ namespace JsonWin32Generator
             if (kind == FuncKind.Fixed)
             {
                 writer.WriteLine(",\"DllImport\":\"{0}\"", importName);
+                writer.WriteLine(",\"EntryPoint\":\"{0}\"", this.mr.GetString(methodImport.Name));
                 writer.WriteLine(",\"CallingConvention\":\"{0}\"", callingConvention);
             }
             writer.WriteLine(",\"ReturnType\":{0}", methodSig.ReturnType.ToJson());
@@ -1078,8 +1169,17 @@ namespace JsonWin32Generator
                     {
                         jsonAttributes.Add("\"Reserved\"");
                     }
+                    else if (attr is CustomAttr.AssociatedEnum)
+                    {
+                        // nothing
+                    }
+                    else if (attr is CustomAttr.Documentation)
+                    {
+                        // nothing
+                    }
                     else
                     {
+                        Console.WriteLine("{0} has unknown attribute {1}", this.mr.GetString(param.Name), attr);
                         Violation.Data();
                     }
                 }
