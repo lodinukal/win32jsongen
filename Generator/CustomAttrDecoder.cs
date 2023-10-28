@@ -553,9 +553,20 @@ namespace JsonWin32Generator
                 return new CustomAttr.MetadataTypedef();
             }
 
-            if (attrName == new NamespaceAndName("System", "AttributeUsageAttribute"))
+            if (attrName == new NamespaceAndName("Windows.Win32.Foundation.Metadata", "AssociatedConstantAttribute"))
             {
-                
+                Enforce.AttrFixedArgCount(attrName, attrArgs, 1);
+                Enforce.AttrNamedArgCount(attrName, attrArgs, 0);
+                return new CustomAttr.AssociatedConstant(
+                    Enforce.FixedAttrAs<string>(attrArgs.FixedArguments[0]));
+            }
+
+            if (attrName == new NamespaceAndName("Windows.Win32.Foundation.Metadata", "IgnoreIfReturnAttribute"))
+            {
+                Enforce.AttrFixedArgCount(attrName, attrArgs, 1);
+                Enforce.AttrNamedArgCount(attrName, attrArgs, 0);
+                return new CustomAttr.IgnoreIfReturn(
+                    Enforce.FixedAttrAs<string>(attrArgs.FixedArguments[0]));
             }
 
             throw new NotImplementedException(Fmt.In($"unhandled custom attribute \"{attrName.Namespace}\", \"{attrName.Name}\""));
@@ -930,6 +941,26 @@ namespace JsonWin32Generator
             internal MetadataTypedef()
             {
             }
+        }
+
+        internal class AssociatedConstant : CustomAttr
+        {
+            internal AssociatedConstant(string name)
+            {
+                this.Name = name;
+            }
+
+            internal string Name { get; }
+        }
+
+        internal class IgnoreIfReturn : CustomAttr
+        {
+            internal IgnoreIfReturn(string value)
+            {
+                this.Value = value;
+            }
+
+            internal string Value { get; }
         }
     }
 }

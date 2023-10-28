@@ -19,6 +19,11 @@ namespace JsonWin32Generator
         private readonly Dictionary<TypeDefinitionHandle, TypeGenInfo> typeMap = new Dictionary<TypeDefinitionHandle, TypeGenInfo>();
         private readonly TypeRefDecoder typeRefDecoder;
 
+        private readonly List<string> doNotGenerateNamespaces = new()
+        {
+            "Windows.Win32.Foundation.Metadata",
+        };
+
         private JsonGenerator(MetadataReader mr)
         {
             this.mr = mr;
@@ -46,6 +51,11 @@ namespace JsonWin32Generator
                 if (typeNamespace.Length == 0)
                 {
                     Enforce.Data(typeName == "<Module>", "found a type without a namespace that is not nested and not '<Module>'");
+                    continue;
+                }
+
+                if (this.doNotGenerateNamespaces.Contains(typeNamespace))
+                {
                     continue;
                 }
 
@@ -362,14 +372,17 @@ namespace JsonWin32Generator
             else if (optionalPropertyKey != null)
             {
                 Enforce.Data(!hasValue);
+
                 writer.WriteLine(",\"ValueType\":\"PropertyKey\"");
                 writer.WriteLine(",\"Value\":{{\"Fmtid\":\"{0}\",\"Pid\":{1}}}", optionalPropertyKey.Fmtid, optionalPropertyKey.Pid);
             }
             else if (optionalConstant != null)
             {
                 Enforce.Data(!hasValue);
-                var trimmed = optionalConstant.Value[1..optionalConstant.Value.IndexOf("}", StringComparison.Ordinal)];
-                var pid = optionalConstant.Value[(optionalConstant.Value.IndexOf("}", StringComparison.Ordinal) + 3)..];
+                int endBrace = optionalConstant.Value.IndexOf("}", StringComparison.Ordinal);
+                bool endBraceAtEnd = (endBrace + 1) == optionalConstant.Value.Length;
+                var trimmed = optionalConstant.Value[1..endBrace];
+                var pid = endBraceAtEnd ? "null" : optionalConstant.Value[(endBrace + 3)..];
                 writer.WriteLine(",\"ValueType\":\"PropertyKey\"");
                 writer.WriteLine(",\"Value\":{{\"Fmtid\":\"{0}\",\"Pid\":{1}}}", trimmed, pid);
             }
@@ -500,6 +513,10 @@ namespace JsonWin32Generator
                 {
                     isMetadataTypedef = true;
                 }
+                else if (attr is CustomAttr.AssociatedConstant)
+                {
+                    // nothing
+                }
                 else
                 {
                     Console.WriteLine("{0} has unknown attribute {1}", typeInfo.Fqn, attr);
@@ -568,7 +585,6 @@ namespace JsonWin32Generator
             }
             else if (typeInfo.BaseTypeName == new NamespaceAndName("System", "ValueType"))
             {
-                Console.WriteLine("DEBUG: {0} {1}", typeInfo.Fqn, isNativeTypedef);
                 Enforce.Data(scopedEnum == false);
                 Enforce.Data(typeInfo.TypeRefTargetKind == TypeGenInfo.TypeRefKind.Default);
                 Enforce.Data(freeFuncAttr == null);
@@ -691,7 +707,7 @@ namespace JsonWin32Generator
                     FieldAttributes.Static |
                     FieldAttributes.Literal |
                     FieldAttributes.HasDefault));
-                Enforce.Data(fieldDef.GetCustomAttributes().Count == 0);
+                // Enforce.Data(fieldDef.GetCustomAttributes().Count == 0);
                 Enforce.Data(fieldDef.GetOffset() == -1);
                 Enforce.Data(fieldDef.GetRelativeVirtualAddress() == 0);
                 Constant valueConstant = this.mr.GetConstant(fieldDef.GetDefaultValue());
@@ -745,7 +761,7 @@ namespace JsonWin32Generator
                     // I could add a "Constants" subfield, but right now only 2 types have these const fields so it's not worth adding
                     // this extra field to every single type just to accomodate some const fields on a couple types.
                     // Maybe I should open a github issue about this?  Ask why these are the only 2 types using const fields.
-                    Enforce.Data(typeInfo.Name == "WSDXML_NODE" || typeInfo.Name == "WhitePoint");
+                    Enforce.Data(typeInfo.Name == "WSDXML_NODE" || typeInfo.Name == "WhitePoint" || typeInfo.Name == "Color");
                     Enforce.Data(fieldDef.GetCustomAttributes().Count == 0);
                     Enforce.Data(fieldDef.GetOffset() == -1);
                     Constant constant = this.mr.GetConstant(fieldDef.GetDefaultValue());
@@ -793,6 +809,10 @@ namespace JsonWin32Generator
                     else if (attr is CustomAttr.NativeBitfield)
                     {
                         // TODO: add native bit field
+                    }
+                    else if (attr is CustomAttr.Documentation)
+                    {
+                        // nothing
                     }
                     else
                     {
@@ -936,6 +956,7 @@ namespace JsonWin32Generator
 
             string? documentation = null;
             string? optionalSupportedOsPlatform = null;
+            string? constant = null;
             Arch[] archLimits = Array.Empty<Arch>();
             bool doesNotReturn = false;
             bool isObselete = false;
@@ -981,6 +1002,10 @@ namespace JsonWin32Generator
                 {
                     // nothing
                 }
+                else if (attr is CustomAttr.Constant c)
+                {
+                    constant = c.Value;
+                }
                 else
                 {
                     Console.WriteLine("{0} has unknown attribute {1}", funcName, attr);
@@ -996,7 +1021,7 @@ namespace JsonWin32Generator
             Enforce.Data(methodImportAttrs.ThrowOnUnmapableChar == null);
             if (kind == FuncKind.Fixed)
             {
-                Enforce.Data(methodImportAttrs.ExactSpelling);
+                // Enforce.Data(methodImportAttrs.ExactSpelling);
                 // Enforce.Data(methodImportAttrs.CallConv == CallConv.Winapi);
                 // Enforce.Data(this.mr.GetString(methodImport.Name) == methodImportAttrs);
             }
@@ -1031,6 +1056,7 @@ namespace JsonWin32Generator
                 writer.WriteLine(",\"DllImport\":\"{0}\"", importName);
                 writer.WriteLine(",\"EntryPoint\":\"{0}\"", this.mr.GetString(methodImport.Name));
                 writer.WriteLine(",\"CallingConvention\":\"{0}\"", callingConvention);
+                writer.WriteLine(",\"Constant\":{0}", constant.JsonString());
             }
             writer.WriteLine(",\"ReturnType\":{0}", methodSig.ReturnType.ToJson());
             {
@@ -1177,9 +1203,17 @@ namespace JsonWin32Generator
                     {
                         // nothing
                     }
+                    else if (attr is CustomAttr.RaiiFree rf)
+                    {
+                        // nothing
+                    }
+                    else if (attr is CustomAttr.IgnoreIfReturn)
+                    {
+                        // nothing
+                    }
                     else
                     {
-                        Console.WriteLine("{0} has unknown attribute {1}", this.mr.GetString(param.Name), attr);
+                        Console.WriteLine("{0} ({1}) has unknown attribute {2}", this.mr.GetString(param.Name), this.mr.GetString(funcDef.Name), attr);
                         Violation.Data();
                     }
                 }

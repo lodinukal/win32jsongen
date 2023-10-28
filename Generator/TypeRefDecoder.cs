@@ -94,6 +94,20 @@ namespace JsonWin32Generator
                         return new TypeRef.MissingClrType(@namespace, name);
                     }
                 }
+                else if (@namespace == "Windows.Foundation.Collections")
+                {
+                    if (name == "IPropertySet")
+                    {
+                        return new TypeRef.MissingClrType(@namespace, name);
+                    }
+                }
+                else if (@namespace == "Windows.Storage.Streams")
+                {
+                    if (name == "IPropertySetSerializer")
+                    {
+                        return new TypeRef.MissingClrType(@namespace, name);
+                    }
+                }
                 else if (@namespace == "Windows.Graphics.Effects")
                 {
                     if (name == "IGraphicsEffectSource")
@@ -130,6 +144,8 @@ namespace JsonWin32Generator
                         return new TypeRef.MissingClrType(@namespace, name);
                     }
                 }
+
+                Console.WriteLine("!!! Unresolved typeRef: {0}.{1}", @namespace, name);
 
                 throw new InvalidOperationException();
             }
