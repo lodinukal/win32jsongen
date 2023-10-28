@@ -7,19 +7,22 @@ namespace JsonWin32Generator
     using System;
     using System.Collections.Generic;
     using System.Collections.Immutable;
+    using System.Linq;
     using System.Reflection.Metadata;
 
     // Implements the ISignatureTypeProvider interface used as a callback by MetadataReader to create objects that represent types.
     internal class TypeRefDecoder : ISignatureTypeProvider<TypeRef, INothing?>
     {
         private readonly Dictionary<string, Api> apiNamespaceMap;
-        private readonly Dictionary<TypeDefinitionHandle, TypeGenInfo> typeMap;
+        private readonly Dictionary<TracedTypeDefinitionHandle, TypeGenInfo> typeMap = new(default(TracedTypeDefinitionHandleComparer));
 
-        internal TypeRefDecoder(Dictionary<string, Api> apiNamespaceMap, Dictionary<TypeDefinitionHandle, TypeGenInfo> typeMap)
+        internal TypeRefDecoder(Dictionary<string, Api> apiNamespaceMap, Dictionary<TracedTypeDefinitionHandle, TypeGenInfo> typeMap)
         {
             this.apiNamespaceMap = apiNamespaceMap;
             this.typeMap = typeMap;
         }
+
+        public bool Empty => this.apiNamespaceMap.Count == 0 && this.typeMap.Count == 0;
 
         public TypeRef GetArrayType(TypeRef from, ArrayShape shape) => new TypeRef.ArrayOf(from, shape);
 
@@ -27,7 +30,7 @@ namespace JsonWin32Generator
 
         public TypeRef GetPrimitiveType(PrimitiveTypeCode typeCode) => TypeRef.Primitive.Get(typeCode);
 
-        public TypeRef GetTypeFromDefinition(MetadataReader mr, TypeDefinitionHandle handle, byte rawTypeKind) => new TypeRef.User(this.typeMap[handle].RefInfo);
+        public TypeRef GetTypeFromDefinition(MetadataReader mr, TypeDefinitionHandle handle, byte rawTypeKind) => new TypeRef.User(this.typeMap[new(mr, handle)].RefInfo);
 
         public TypeRef GetByReferenceType(TypeRef from) => throw Violation.Data();
 
@@ -145,8 +148,21 @@ namespace JsonWin32Generator
                     }
                 }
 
-                Console.WriteLine("!!! Unresolved typeRef: {0}.{1}", @namespace, name);
+                foreach (var api in this.apiNamespaceMap.Values)
+                {
+                    if (api.Name == @namespace)
+                    {
+                        foreach (var kv in api.TypeNameFqnMap)
+                        {
+                            if (kv.Key == name)
+                            {
+                                return new TypeRef.User(api.TopLevelTypes.LookupRefInfoByFqn(kv.Value));
+                            }
+                        }
+                    }
+                }
 
+                Console.WriteLine("!!! Unresolved typeRef: {0}.{1}", @namespace, name);
                 throw new InvalidOperationException();
             }
 

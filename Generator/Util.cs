@@ -9,6 +9,7 @@ namespace JsonWin32Generator
 {
     using System;
     using System.Collections.Generic;
+    using System.Diagnostics.CodeAnalysis;
     using System.IO;
     using System.Reflection;
     using System.Reflection.Metadata;
@@ -18,6 +19,41 @@ namespace JsonWin32Generator
 
     internal interface INothing
     {
+    }
+
+    internal readonly struct ReaderInfo
+    {
+        public readonly MetadataReader Reader;
+        public readonly List<string> Namespaces = new();
+        public readonly HashSet<string> NamespacesToSkip;
+
+        public ReaderInfo(MetadataReader reader, HashSet<string>? namespacesToSkip = null)
+        {
+            this.Reader = reader;
+            this.NamespacesToSkip = namespacesToSkip ?? new();
+        }
+    }
+
+    internal readonly struct TracedTypeDefinitionHandle
+    {
+        public readonly MetadataReader Reader;
+        public readonly TypeDefinitionHandle Handle;
+
+        public TracedTypeDefinitionHandle(MetadataReader reader, TypeDefinitionHandle handle)
+        {
+            this.Reader = reader;
+            this.Handle = handle;
+        }
+    }
+
+    internal readonly struct TracedTypeDefinitionHandleComparer : IEqualityComparer<TracedTypeDefinitionHandle>
+    {
+        public bool Equals(TracedTypeDefinitionHandle x, TracedTypeDefinitionHandle y) => object.ReferenceEquals(x.Reader, y.Reader) && x.Handle.Equals(y.Handle);
+
+        public int GetHashCode([DisallowNull] TracedTypeDefinitionHandle obj)
+        {
+            return HashCode.Combine(obj.Reader, obj.Handle);
+        }
     }
 
     internal readonly struct Defer : IDisposable
@@ -47,7 +83,7 @@ namespace JsonWin32Generator
         internal static TValue GetOrCreate<TKey, TValue>(this IDictionary<TKey, TValue> dict, TKey key)
             where TValue : new()
         {
-            if (!dict.TryGetValue(key, out TValue val))
+            if (!dict.TryGetValue(key, out TValue? val))
             {
                 val = new TValue();
                 dict.Add(key, val);

@@ -14,29 +14,39 @@ namespace JsonWin32Generator
 
     internal class JsonGenerator
     {
-        private readonly MetadataReader mr;
-        private readonly Dictionary<string, Api> apiNamespaceMap = new Dictionary<string, Api>();
-        private readonly Dictionary<TypeDefinitionHandle, TypeGenInfo> typeMap = new Dictionary<TypeDefinitionHandle, TypeGenInfo>();
-        private readonly TypeRefDecoder typeRefDecoder;
+        private readonly List<MetadataReader> readers = new();
+        private readonly Dictionary<string, Api> apiNamespaceMap = new();
+        private readonly Dictionary<TracedTypeDefinitionHandle, TypeGenInfo> typeMap = new(default(TracedTypeDefinitionHandleComparer));
+        private TypeRefDecoder typeRefDecoder;
 
-        private readonly List<string> doNotGenerateNamespaces = new()
+        private JsonGenerator()
         {
-            "Windows.Win32.Foundation.Metadata",
-        };
+            this.typeRefDecoder = new(this.apiNamespaceMap, this.typeMap);
+        }
 
-        private JsonGenerator(MetadataReader mr)
+        private enum FuncKind
         {
-            this.mr = mr;
+            Fixed,
+            Ptr,
+            Com,
+        }
 
-            Dictionary<string, string> apiNamespaceToName = new Dictionary<string, string>();
+        public void AddReader(ReaderInfo reader)
+        {
+            this.readers.Add(reader.Reader);
+
+            Dictionary<string, string> apiNamespaceToName = new();
 
             // ---------------------------------------------------------------
             // Scan all types and sort into the api they belong to
             // ---------------------------------------------------------------
-            List<TypeDefinitionHandle> nestedTypes = new List<TypeDefinitionHandle>();
-            foreach (TypeDefinitionHandle typeDefHandle in this.mr.TypeDefinitions)
+            List<TypeDefinitionHandle> nestedTypes = new();
+            int totalTypes = reader.Reader.TypeDefinitions.Count;
+            int typesProcessed = 0;
+            foreach (TypeDefinitionHandle typeDefHandle in reader.Reader.TypeDefinitions)
             {
-                TypeDefinition typeDef = mr.GetTypeDefinition(typeDefHandle);
+                TypeDefinition typeDef = reader.Reader.GetTypeDefinition(typeDefHandle);
+                typesProcessed++;
 
                 // skip nested types until we get all the non-nested types, this is because
                 // we need to be able to look up the enclosing type to get all the info we need
@@ -46,15 +56,15 @@ namespace JsonWin32Generator
                     continue;
                 }
 
-                string typeName = mr.GetString(typeDef.Name);
-                string typeNamespace = mr.GetString(typeDef.Namespace);
+                string typeName = reader.Reader.GetString(typeDef.Name);
+                string typeNamespace = reader.Reader.GetString(typeDef.Namespace);
                 if (typeNamespace.Length == 0)
                 {
                     Enforce.Data(typeName == "<Module>", "found a type without a namespace that is not nested and not '<Module>'");
                     continue;
                 }
 
-                if (this.doNotGenerateNamespaces.Contains(typeNamespace))
+                if (reader.NamespacesToSkip.Contains(typeNamespace))
                 {
                     continue;
                 }
@@ -63,7 +73,10 @@ namespace JsonWin32Generator
                 if (!this.apiNamespaceMap.TryGetValue(typeNamespace, out api))
                 {
                     api = new Api(typeNamespace);
+                    reader.Namespaces.Add(typeNamespace);
                     this.apiNamespaceMap.Add(typeNamespace, api);
+                    Console.WriteLine("DEBUG: Found Namespace: {0}", typeNamespace);
+                    Console.WriteLine("DEBUG: {0}/{1} processed", typesProcessed, totalTypes);
                 }
 
                 // The "Apis" type is a specially-named type reserved to contain all the constant
@@ -76,8 +89,8 @@ namespace JsonWin32Generator
                 }
                 else
                 {
-                    TypeGenInfo typeInfo = TypeGenInfo.CreateNotNested(mr, typeDef, typeName, typeNamespace, apiNamespaceToName);
-                    this.typeMap.Add(typeDefHandle, typeInfo);
+                    TypeGenInfo typeInfo = TypeGenInfo.CreateNotNested(reader.Reader, typeDef, typeName, typeNamespace, apiNamespaceToName);
+                    this.typeMap.Add(new(reader.Reader, typeDefHandle), typeInfo);
                     api.AddTopLevelType(typeInfo);
                 }
             }
@@ -93,12 +106,13 @@ namespace JsonWin32Generator
                 for (int i = nestedTypes.Count - 1; i >= 0; i--)
                 {
                     TypeDefinitionHandle typeDefHandle = nestedTypes[i];
-                    TypeDefinition typeDef = mr.GetTypeDefinition(typeDefHandle);
+                    TracedTypeDefinitionHandle tracedTypeDefHandle = new(reader.Reader, typeDefHandle);
+                    TypeDefinition typeDef = reader.Reader.GetTypeDefinition(typeDefHandle);
                     Enforce.Invariant(typeDef.IsNested);
-                    if (this.typeMap.TryGetValue(typeDef.GetDeclaringType(), out TypeGenInfo? enclosingType))
+                    if (this.typeMap.TryGetValue(new(reader.Reader, typeDef.GetDeclaringType()), out TypeGenInfo? enclosingType))
                     {
-                        TypeGenInfo typeInfo = TypeGenInfo.CreateNested(mr, typeDef, enclosingType);
-                        this.typeMap.Add(typeDefHandle, typeInfo);
+                        TypeGenInfo typeInfo = TypeGenInfo.CreateNested(reader.Reader, typeDef, enclosingType);
+                        this.typeMap.Add(tracedTypeDefHandle, typeInfo);
                         enclosingType.AddNestedType(typeInfo);
                         nestedTypes.RemoveAt(i);
                         i--;
@@ -117,34 +131,39 @@ namespace JsonWin32Generator
                 }
             }
 
-            this.typeRefDecoder = new TypeRefDecoder(this.apiNamespaceMap, this.typeMap);
+            Console.WriteLine("DEBUG: {0} namespaces", this.apiNamespaceMap.Count);
         }
 
-        private enum FuncKind
+        internal static void Generate(List<ReaderInfo> readers, string outDir, Dictionary<string, ApiPatch>? patches = null)
         {
-            Fixed,
-            Ptr,
-            Com,
-        }
+            JsonGenerator generator = new();
 
-        internal static void Generate(MetadataReader mr, string outDir)
-        {
-            JsonGenerator generator = new JsonGenerator(mr);
-
-            Dictionary<string, ApiPatch> apiMap = PatchConfig.CreateApiMap();
-
-            foreach (Api api in generator.apiNamespaceMap.Values)
+            for (int index = 0; index < readers.Count; index++)
             {
-                string filepath = Path.Combine(outDir, api.Name + ".json");
-                using var fileStream = new FileStream(filepath, FileMode.Create, FileAccess.Write, FileShare.Read);
+                ReaderInfo reader = readers[index];
+                Console.WriteLine("Processing reader {0} of {1}", index + 1, readers.Count);
+                generator.AddReader(reader);
+                readers[index] = reader;
+            }
 
-                // Encode the stream as UTF-8 without adding the byte order mark.
-                using var streamWriter = new StreamWriter(fileStream, new UTF8Encoding(false));
-                var writer = new TabWriter(streamWriter);
-                Console.WriteLine("Api: {0}", api.Name);
-                ApiPatch apiPatch = apiMap.GetValueOrDefault(api.Name, Patch.EmptyApi);
-                apiPatch.ApplyCount += 1;
-                generator.GenerateApi(writer, apiPatch, api);
+            Dictionary<string, ApiPatch> apiMap = patches ?? PatchConfig.CreateApiMap();
+
+            foreach (ReaderInfo reader in readers)
+            {
+                foreach (var @namespace in reader.Namespaces)
+                {
+                    Api api = generator.apiNamespaceMap[@namespace];
+                    string filepath = Path.Combine(outDir, api.Name + ".json");
+                    using var fileStream = new FileStream(filepath, FileMode.Create, FileAccess.Write, FileShare.Read);
+
+                    // Encode the stream as UTF-8 without adding the byte order mark.
+                    using var streamWriter = new StreamWriter(fileStream, new UTF8Encoding(false));
+                    var writer = new TabWriter(streamWriter);
+                    Console.WriteLine("Api: {0}", api.Name);
+                    ApiPatch apiPatch = apiMap.GetValueOrDefault(api.Name, Patch.EmptyApi);
+                    apiPatch.ApplyCount += 1;
+                    generator.GenerateApi(reader, writer, apiPatch, api);
+                }
             }
 
             foreach (KeyValuePair<string, ApiPatch> apiPatchPair in apiMap)
@@ -184,7 +203,7 @@ namespace JsonWin32Generator
             }
         }
 
-        private void GenerateApi(TabWriter writer, ApiPatch apiPatch, Api api)
+        private void GenerateApi(ReaderInfo reader, TabWriter writer, ApiPatch apiPatch, Api api)
         {
             writer.WriteLine("{");
             writer.WriteLine();
@@ -195,7 +214,7 @@ namespace JsonWin32Generator
                 foreach (FieldDefinitionHandle fieldDef in api.Constants)
                 {
                     writer.Tab();
-                    this.GenerateConst(writer, apiPatch, fieldPrefix, fieldDef);
+                    this.GenerateConst(reader, writer, apiPatch, fieldPrefix, fieldDef);
                     writer.Untab();
                     fieldPrefix = ",";
                 }
@@ -219,7 +238,7 @@ namespace JsonWin32Generator
                     }
 
                     writer.Tab();
-                    this.GenerateType(writer, typePatch, fieldPrefix, typeInfo);
+                    this.GenerateType(reader, writer, typePatch, fieldPrefix, typeInfo);
                     writer.Untab();
                     fieldPrefix = ",";
 
@@ -240,7 +259,7 @@ namespace JsonWin32Generator
                 foreach (MethodDefinitionHandle funcHandle in api.Funcs)
                 {
                     writer.Tab();
-                    var generatedFuncName = this.GenerateFunc(writer, apiPatch, fieldPrefix, funcHandle, FuncKind.Fixed);
+                    var generatedFuncName = this.GenerateFunc(reader, writer, apiPatch, fieldPrefix, funcHandle, FuncKind.Fixed);
                     writer.Untab();
                     fieldPrefix = ",";
                     if (!funcsRegistered.Contains(generatedFuncName))
@@ -274,10 +293,10 @@ namespace JsonWin32Generator
             writer.WriteLine("}");
         }
 
-        private void GenerateConst(TabWriter writer, ApiPatch apiPatch, string constFieldPrefix, FieldDefinitionHandle fieldDefHandle)
+        private void GenerateConst(ReaderInfo reader, TabWriter writer, ApiPatch apiPatch, string constFieldPrefix, FieldDefinitionHandle fieldDefHandle)
         {
-            FieldDefinition fieldDef = this.mr.GetFieldDefinition(fieldDefHandle);
-            string name = this.mr.GetString(fieldDef.Name);
+            FieldDefinition fieldDef = reader.Reader.GetFieldDefinition(fieldDefHandle);
+            string name = reader.Reader.GetString(fieldDef.Name);
 
             ConstPatch constPatch = apiPatch.ConstMap.GetValueOrDefault(name, Patch.EmptyConst);
             if (constPatch.Config.Duplicated)
@@ -323,7 +342,7 @@ namespace JsonWin32Generator
             // TODO: what is fieldDef.GetMarshallingDescriptor?
             foreach (CustomAttributeHandle attrHandle in fieldDef.GetCustomAttributes())
             {
-                CustomAttr attr = CustomAttr.Decode(this.mr, attrHandle);
+                CustomAttr attr = CustomAttr.Decode(reader.Reader, attrHandle);
                 if (object.ReferenceEquals(attr, CustomAttr.Const.Instance))
                 {
                     // we already assume "const" on all constant values where this matters (i.e. string literals)
@@ -342,7 +361,7 @@ namespace JsonWin32Generator
                 }
                 else if (attr is CustomAttr.NativeEncoding ne)
                 {
-                    // nothing
+                    // TODO: do something with this
                 }
                 else if (attr is CustomAttr.Constant c)
                 {
@@ -350,7 +369,7 @@ namespace JsonWin32Generator
                 }
                 else if (attr is CustomAttr.Documentation)
                 {
-                    // nothing
+                    // TODO: do something with this
                 }
                 else
                 {
@@ -397,14 +416,14 @@ namespace JsonWin32Generator
             else
             {
                 Enforce.Data(hasValue);
-                Constant constant = this.mr.GetConstant(fieldDef.GetDefaultValue());
+                Constant constant = reader.Reader.GetConstant(fieldDef.GetDefaultValue());
                 writer.WriteLine(",\"ValueType\":\"{0}\"", constant.TypeCode.ToPrimitiveTypeCode());
-                writer.WriteLine(",\"Value\":{0}", constant.ReadConstValue(this.mr));
+                writer.WriteLine(",\"Value\":{0}", constant.ReadConstValue(reader.Reader));
             }
             WriteJsonArray(writer, ",\"Attrs\":", jsonAttributes, string.Empty);
         }
 
-        private void GenerateType(TabWriter writer, TypePatch typePatch, string typeFieldPrefix, TypeGenInfo typeInfo)
+        private void GenerateType(ReaderInfo reader, TabWriter writer, TypePatch typePatch, string typeFieldPrefix, TypeGenInfo typeInfo)
         {
             writer.WriteLine("{0}{{", typeFieldPrefix);
             writer.Tab();
@@ -417,7 +436,7 @@ namespace JsonWin32Generator
             Enforce.Data(typeInfo.Def.GetNestedTypes().Length == typeInfo.NestedTypeCount);
             foreach (TypeDefinitionHandle nestedTypeHandle in typeInfo.Def.GetNestedTypes())
             {
-                Enforce.Data(typeInfo.HasNestedType(this.typeMap[nestedTypeHandle]));
+                Enforce.Data(typeInfo.HasNestedType(this.typeMap[new(reader.Reader, nestedTypeHandle)]));
             }
 
             DecodedTypeAttributes attrs = new DecodedTypeAttributes(typeInfo.Def.Attributes);
@@ -429,7 +448,6 @@ namespace JsonWin32Generator
 
             // TODO: do something with these attributes (they are no longer used)
             string? documentation = null;
-            bool isObselete = false;
             string? guid = null;
             string? freeFuncAttr = null;
             bool isNativeTypedef = false;
@@ -445,7 +463,7 @@ namespace JsonWin32Generator
 
             foreach (CustomAttributeHandle attrHandle in typeInfo.Def.GetCustomAttributes())
             {
-                CustomAttr attr = CustomAttr.Decode(this.mr, attrHandle);
+                CustomAttr attr = CustomAttr.Decode(reader.Reader, attrHandle);
                 if (attr is CustomAttr.Guid guidAttr)
                 {
                     Enforce.Data(guid == null);
@@ -498,7 +516,7 @@ namespace JsonWin32Generator
                 }
                 else if (attr is CustomAttr.Obsolete)
                 {
-                    isObselete = true;
+                    // TODO: do something with this
                 }
                 else if (attr is CustomAttr.Documentation documentationAttr)
                 {
@@ -507,11 +525,11 @@ namespace JsonWin32Generator
                 }
                 else if (attr is CustomAttr.Ansi)
                 {
-                    // nothing
+                    // TODO: do something with this
                 }
                 else if (attr is CustomAttr.Unicode)
                 {
-                    // nothing
+                    // TODO: do something with this
                 }
                 else if (attr is CustomAttr.StructSizeField ssf)
                 {
@@ -523,7 +541,7 @@ namespace JsonWin32Generator
                 }
                 else if (attr is CustomAttr.AssociatedConstant)
                 {
-                    // nothing
+                    // TODO: do something with this
                 }
                 else
                 {
@@ -542,7 +560,7 @@ namespace JsonWin32Generator
                 writer.WriteLine(",\"AlsoUsableFor\":{0}", optionalAlsoUsableFor.JsonString());
                 Enforce.Data(attrs.Layout == TypeLayoutKind.Sequential);
                 Enforce.Data(typeInfo.Def.GetFields().Count == 1);
-                FieldDefinition targetDef = this.mr.GetFieldDefinition(typeInfo.Def.GetFields().First());
+                FieldDefinition targetDef = reader.Reader.GetFieldDefinition(typeInfo.Def.GetFields().First());
                 string targetDefJson = targetDef.DecodeSignature(this.typeRefDecoder, null).ToJson();
                 writer.WriteLine(",\"Def\":{0}", targetDefJson);
                 Enforce.Data(guid == null);
@@ -560,7 +578,7 @@ namespace JsonWin32Generator
                 writer.WriteLine(",\"AlsoUsableFor\":{0}", optionalAlsoUsableFor.JsonString());
                 Enforce.Data(attrs.Layout == TypeLayoutKind.Sequential);
                 Enforce.Data(typeInfo.Def.GetFields().Count == 1);
-                FieldDefinition targetDef = this.mr.GetFieldDefinition(typeInfo.Def.GetFields().First());
+                FieldDefinition targetDef = reader.Reader.GetFieldDefinition(typeInfo.Def.GetFields().First());
                 string targetDefJson = targetDef.DecodeSignature(this.typeRefDecoder, null).ToJson();
                 writer.WriteLine(",\"Def\":{0}", targetDefJson);
                 Enforce.Data(guid == null);
@@ -578,7 +596,7 @@ namespace JsonWin32Generator
                 Enforce.Data(freeFuncAttr == null);
                 Enforce.Data(optionalAlsoUsableFor is null);
                 Enforce.Data(invalidHandleValue == null);
-                this.GenerateComType(writer, typePatch.ToComPatch(), typeInfo, guid, isAgile);
+                this.GenerateComType(reader, writer, typePatch.ToComPatch(), typeInfo, guid, isAgile);
             }
             else if (typeInfo.BaseTypeName == new NamespaceAndName("System", "Enum"))
             {
@@ -589,7 +607,7 @@ namespace JsonWin32Generator
                 Enforce.Data(attrs.Layout == TypeLayoutKind.Auto);
                 Enforce.Data(invalidHandleValue == null);
                 Enforce.Data(!isAgile);
-                this.GenerateEnum(writer, typeInfo, isFlags, scopedEnum);
+                GenerateEnum(reader, writer, typeInfo, isFlags, scopedEnum);
             }
             else if (typeInfo.BaseTypeName == new NamespaceAndName("System", "ValueType"))
             {
@@ -601,7 +619,7 @@ namespace JsonWin32Generator
                 Enforce.Data(!isAgile);
                 if (guid == null || typePatch.Config.NotComClassID)
                 {
-                    this.GenerateStruct(writer, typePatch, typeInfo, attrs.Layout);
+                    this.GenerateStruct(reader, writer, typePatch, typeInfo, attrs.Layout);
                 }
                 else
                 {
@@ -627,7 +645,7 @@ namespace JsonWin32Generator
                 Enforce.Data(invalidHandleValue == null);
                 Enforce.Data(!isAgile);
                 Enforce.Data(attrs.Layout == TypeLayoutKind.Auto);
-                this.GenerateFunctionPointer(writer, typeInfo);
+                this.GenerateFunctionPointer(reader, writer, typeInfo);
             }
             else
             {
@@ -635,7 +653,7 @@ namespace JsonWin32Generator
             }
         }
 
-        private void GenerateNestedTypes(TabWriter writer, TypePatch enclosingTypePatch, TypeGenInfo typeInfo)
+        private void GenerateNestedTypes(ReaderInfo reader, TabWriter writer, TypePatch enclosingTypePatch, TypeGenInfo typeInfo)
         {
             string nestedFieldPrefix = string.Empty;
             writer.WriteLine(",\"NestedTypes\":[");
@@ -645,21 +663,21 @@ namespace JsonWin32Generator
                 nestedTypePatch.ApplyCount += 1;
 
                 writer.Tab();
-                this.GenerateType(writer, nestedTypePatch, nestedFieldPrefix, nestedType);
+                this.GenerateType(reader, writer, nestedTypePatch, nestedFieldPrefix, nestedType);
                 writer.Untab();
                 nestedFieldPrefix = ",";
             }
             writer.WriteLine("]");
         }
 
-        private void GenerateComType(TabWriter writer, ComTypePatch comTypePatch, TypeGenInfo typeInfo, string? guid, bool isAgile)
+        private void GenerateComType(ReaderInfo reader, TabWriter writer, ComTypePatch comTypePatch, TypeGenInfo typeInfo, string? guid, bool isAgile)
         {
             Enforce.Data(typeInfo.Def.GetFields().Count == 0);
 
             writer.WriteLine(",\"Kind\":\"Com\"");
             writer.WriteLine(",\"Guid\":{0}", guid.JsonString());
             {
-                List<string> attrs = new List<string>();
+                List<string> attrs = new();
                 if (isAgile)
                 {
                     attrs.Add("\"Agile\"");
@@ -672,10 +690,10 @@ namespace JsonWin32Generator
             {
                 Enforce.Data(typeInfo.Def.GetInterfaceImplementations().Count == 1);
                 InterfaceImplementationHandle ifaceImplHandle = typeInfo.Def.GetInterfaceImplementations().First();
-                InterfaceImplementation ifaceImpl = this.mr.GetInterfaceImplementation(ifaceImplHandle);
+                InterfaceImplementation ifaceImpl = reader.Reader.GetInterfaceImplementation(ifaceImplHandle);
                 Enforce.Data(ifaceImpl.GetCustomAttributes().Count == 0);
                 Enforce.Data(ifaceImpl.Interface.Kind == HandleKind.TypeReference);
-                TypeRef ifaceType = this.typeRefDecoder.GetTypeFromReference(this.mr, (TypeReferenceHandle)ifaceImpl.Interface);
+                TypeRef ifaceType = this.typeRefDecoder.GetTypeFromReference(reader.Reader, (TypeReferenceHandle)ifaceImpl.Interface);
                 interfaceJson = ifaceType.ToJson();
             }
             writer.WriteLine(",\"Interface\":{0}", interfaceJson);
@@ -684,7 +702,7 @@ namespace JsonWin32Generator
             string methodElementPrefix = string.Empty;
             foreach (MethodDefinitionHandle methodDefHandle in typeInfo.Def.GetMethods())
             {
-                this.GenerateFunc(writer, comTypePatch, methodElementPrefix, methodDefHandle, FuncKind.Com);
+                this.GenerateFunc(reader, writer, comTypePatch, methodElementPrefix, methodDefHandle, FuncKind.Com);
                 methodElementPrefix = ",";
             }
             writer.Untab();
@@ -692,7 +710,9 @@ namespace JsonWin32Generator
             Enforce.Data(typeInfo.NestedTypeCount == 0);
         }
 
-        private void GenerateEnum(TabWriter writer, TypeGenInfo typeInfo, bool isFlags, bool isScoped)
+#pragma warning disable SA1204 // Static elements should appear before instance elements
+        private static void GenerateEnum(ReaderInfo reader, TabWriter writer, TypeGenInfo typeInfo, bool isFlags, bool isScoped)
+#pragma warning restore SA1204 // Static elements should appear before instance elements
         {
             writer.WriteLine(",\"Kind\":\"Enum\"");
             writer.WriteLine(",\"Flags\":{0}", isFlags.Json());
@@ -703,8 +723,8 @@ namespace JsonWin32Generator
             ConstantTypeCode? integerBase = null;
             foreach (FieldDefinitionHandle fieldDefHandle in typeInfo.Def.GetFields())
             {
-                FieldDefinition fieldDef = this.mr.GetFieldDefinition(fieldDefHandle);
-                string fieldName = this.mr.GetString(fieldDef.Name);
+                FieldDefinition fieldDef = reader.Reader.GetFieldDefinition(fieldDefHandle);
+                string fieldName = reader.Reader.GetString(fieldDef.Name);
                 if (fieldDef.Attributes == (FieldAttributes.Public | FieldAttributes.SpecialName | FieldAttributes.RTSpecialName))
                 {
                     Enforce.Data(fieldName == "value__");
@@ -715,13 +735,14 @@ namespace JsonWin32Generator
                     FieldAttributes.Static |
                     FieldAttributes.Literal |
                     FieldAttributes.HasDefault));
+
                 // Enforce.Data(fieldDef.GetCustomAttributes().Count == 0);
                 Enforce.Data(fieldDef.GetOffset() == -1);
                 Enforce.Data(fieldDef.GetRelativeVirtualAddress() == 0);
-                Constant valueConstant = this.mr.GetConstant(fieldDef.GetDefaultValue());
+                Constant valueConstant = reader.Reader.GetConstant(fieldDef.GetDefaultValue());
                 integerBase = integerBase.HasValue ? integerBase.Value : valueConstant.TypeCode;
                 Enforce.Data(integerBase == valueConstant.TypeCode);
-                string value = valueConstant.ReadConstValue(this.mr);
+                string value = valueConstant.ReadConstValue(reader.Reader);
                 writer.WriteLine("{0}{{\"Name\":\"{1}\",\"Value\":{2}}}", valueElemPrefix, fieldName, value);
                 valueElemPrefix = ",";
             }
@@ -733,7 +754,7 @@ namespace JsonWin32Generator
             Enforce.Data(typeInfo.NestedTypeCount == 0);
         }
 
-        private void GenerateStruct(TabWriter writer, TypePatch typePatch, TypeGenInfo typeInfo, TypeLayoutKind layoutKind)
+        private void GenerateStruct(ReaderInfo reader, TabWriter writer, TypePatch typePatch, TypeGenInfo typeInfo, TypeLayoutKind layoutKind)
         {
             string kind;
             if (layoutKind == TypeLayoutKind.Explicit)
@@ -755,12 +776,12 @@ namespace JsonWin32Generator
             string fieldElemPrefix = string.Empty;
             foreach (FieldDefinitionHandle fieldDefHandle in typeInfo.Def.GetFields())
             {
-                FieldDefinition fieldDef = this.mr.GetFieldDefinition(fieldDefHandle);
+                FieldDefinition fieldDef = reader.Reader.GetFieldDefinition(fieldDefHandle);
                 if (layoutKind == TypeLayoutKind.Explicit)
                 {
                     Enforce.Data(fieldDef.GetOffset() == 0);
                 }
-                string fieldName = this.mr.GetString(fieldDef.Name);
+                string fieldName = reader.Reader.GetString(fieldDef.Name);
                 Enforce.Data(fieldDef.GetRelativeVirtualAddress() == 0);
                 if (fieldDef.Attributes == (FieldAttributes.Public | FieldAttributes.Static | FieldAttributes.Literal | FieldAttributes.HasDefault))
                 {
@@ -772,8 +793,8 @@ namespace JsonWin32Generator
                     Enforce.Data(typeInfo.Name == "WSDXML_NODE" || typeInfo.Name == "WhitePoint" || typeInfo.Name == "Color");
                     Enforce.Data(fieldDef.GetCustomAttributes().Count == 0);
                     Enforce.Data(fieldDef.GetOffset() == -1);
-                    Constant constant = this.mr.GetConstant(fieldDef.GetDefaultValue());
-                    string value = constant.ReadConstValue(this.mr);
+                    Constant constant = reader.Reader.GetConstant(fieldDef.GetDefaultValue());
+                    string value = constant.ReadConstValue(reader.Reader);
                     constFields.Add(Fmt.In($"{constant.TypeCode} {fieldName} = {value}"));
                     continue;
                 }
@@ -785,7 +806,7 @@ namespace JsonWin32Generator
                 List<string> jsonAttributes = new List<string>();
                 foreach (CustomAttributeHandle attrHandle in fieldDef.GetCustomAttributes())
                 {
-                    CustomAttr attr = CustomAttr.Decode(this.mr, attrHandle);
+                    CustomAttr attr = CustomAttr.Decode(reader.Reader, attrHandle);
                     if (object.ReferenceEquals(attr, CustomAttr.Const.Instance))
                     {
                         jsonAttributes.Add("\"Const\"");
@@ -808,11 +829,11 @@ namespace JsonWin32Generator
                     }
                     else if (attr is CustomAttr.FlexibleArray)
                     {
-                        // nothing
+                        // TODO: do something with this
                     }
                     else if (attr is CustomAttr.AssociatedEnum)
                     {
-                        // nothing
+                        // TODO: do something with this
                     }
                     else if (attr is CustomAttr.NativeBitfield)
                     {
@@ -820,7 +841,7 @@ namespace JsonWin32Generator
                     }
                     else if (attr is CustomAttr.Documentation)
                     {
-                        // nothing
+                        // TODO: do something with this
                     }
                     else
                     {
@@ -859,10 +880,10 @@ namespace JsonWin32Generator
                     string.Join(", ", constFields));
             }
             Enforce.Data(typeInfo.Def.GetMethods().Count == 0);
-            this.GenerateNestedTypes(writer, typePatch, typeInfo);
+            this.GenerateNestedTypes(reader, writer, typePatch, typeInfo);
         }
 
-        private void GenerateFunctionPointer(TabWriter writer, TypeGenInfo typeInfo)
+        private void GenerateFunctionPointer(ReaderInfo reader, TabWriter writer, TypeGenInfo typeInfo)
         {
             Enforce.Data(typeInfo.Def.GetFields().Count == 0);
             Enforce.Data(typeInfo.NestedTypeCount == 0);
@@ -875,7 +896,7 @@ namespace JsonWin32Generator
                 if (firstMethod)
                 {
                     firstMethod = false;
-                    Enforce.Data(this.mr.GetString(this.mr.GetMethodDefinition(methodHandle).Name) == ".ctor");
+                    Enforce.Data(reader.Reader.GetString(reader.Reader.GetMethodDefinition(methodHandle).Name) == ".ctor");
                 }
                 else
                 {
@@ -884,10 +905,10 @@ namespace JsonWin32Generator
                 }
             }
             Enforce.Data(funcMethodHandle != null);
-            this.GenerateFuncCommon(writer, IFuncPatchMap.None, funcMethodHandle!.Value, FuncKind.Ptr);
+            this.GenerateFuncCommon(reader, writer, IFuncPatchMap.None, funcMethodHandle!.Value, FuncKind.Ptr);
         }
 
-        private string GenerateFunc(TabWriter writer, IFuncPatchMap funcPatchMap, string funcFieldPrefix, MethodDefinitionHandle funcHandle, FuncKind kind)
+        private string GenerateFunc(ReaderInfo reader, TabWriter writer, IFuncPatchMap funcPatchMap, string funcFieldPrefix, MethodDefinitionHandle funcHandle, FuncKind kind)
         {
             writer.WriteLine("{0}{{", funcFieldPrefix);
             writer.Tab();
@@ -896,12 +917,12 @@ namespace JsonWin32Generator
                 writer.Untab();
                 writer.WriteLine("}");
             });
-            return this.GenerateFuncCommon(writer, funcPatchMap, funcHandle, kind);
+            return this.GenerateFuncCommon(reader, writer, funcPatchMap, funcHandle, kind);
         }
 
-        private string GenerateFuncCommon(TabWriter writer, IFuncPatchMap funcPatchMap, MethodDefinitionHandle funcHandle, FuncKind kind)
+        private string GenerateFuncCommon(ReaderInfo reader, TabWriter writer, IFuncPatchMap funcPatchMap, MethodDefinitionHandle funcHandle, FuncKind kind)
         {
-            MethodDefinition funcDef = this.mr.GetMethodDefinition(funcHandle);
+            MethodDefinition funcDef = reader.Reader.GetMethodDefinition(funcHandle);
             string funcName = string.Empty;
 
             if (kind == FuncKind.Ptr)
@@ -910,7 +931,7 @@ namespace JsonWin32Generator
             }
             else
             {
-                funcName = this.mr.GetString(funcDef.Name);
+                funcName = reader.Reader.GetString(funcDef.Name);
                 writer.WriteLine("\"Name\":\"{0}\"", funcName);
             }
 
@@ -970,7 +991,7 @@ namespace JsonWin32Generator
             bool isObselete = false;
             foreach (CustomAttributeHandle attrHandle in funcDef.GetCustomAttributes())
             {
-                CustomAttr attr = CustomAttr.Decode(this.mr, attrHandle);
+                CustomAttr attr = CustomAttr.Decode(reader.Reader, attrHandle);
                 if (attr is CustomAttr.SupportedOSPlatform supportedOsPlatform)
                 {
                     Enforce.Data(optionalSupportedOsPlatform is null);
@@ -987,11 +1008,11 @@ namespace JsonWin32Generator
                 }
                 else if (attr is CustomAttr.CanReturnMultipleSuccessValues)
                 {
-                    // nothing
+                    // TODO: do something with this
                 }
                 else if (attr is CustomAttr.CanReturnErrorsAsSuccess)
                 {
-                    // nothing
+                    // TODO: do something with this
                 }
                 else if (attr is CustomAttr.Obsolete obselete)
                 {
@@ -1004,11 +1025,11 @@ namespace JsonWin32Generator
                 }
                 else if (attr is CustomAttr.Ansi)
                 {
-                    // nothing
+                    // TODO: do something with this
                 }
                 else if (attr is CustomAttr.Unicode)
                 {
-                    // nothing
+                    // TODO: do something with this
                 }
                 else if (attr is CustomAttr.Constant c)
                 {
@@ -1031,23 +1052,24 @@ namespace JsonWin32Generator
             {
                 // Enforce.Data(methodImportAttrs.ExactSpelling);
                 // Enforce.Data(methodImportAttrs.CallConv == CallConv.Winapi);
-                // Enforce.Data(this.mr.GetString(methodImport.Name) == methodImportAttrs);
+                // Enforce.Data(reader.Reader.GetString(methodImport.Name) == methodImportAttrs);
             }
             else
             {
                 Enforce.Data(!methodImportAttrs.ExactSpelling);
                 Enforce.Data(methodImportAttrs.CallConv == CallConv.None);
-                Enforce.Data(this.mr.GetString(methodImport.Name).Length == 0);
+                Enforce.Data(reader.Reader.GetString(methodImport.Name).Length == 0);
             }
 
-            ModuleReference moduleRef = this.mr.GetModuleReference(methodImport.Module);
+            ModuleReference moduleRef = reader.Reader.GetModuleReference(methodImport.Module);
             Enforce.Data(moduleRef.GetCustomAttributes().Count == 0);
-            string importName = (kind == FuncKind.Fixed) ? this.mr.GetString(moduleRef.Name) : string.Empty;
+            string importName = (kind == FuncKind.Fixed) ? reader.Reader.GetString(moduleRef.Name) : string.Empty;
             var callingConvention = (kind == FuncKind.Fixed) ? methodImportAttrs.CallConv.ToString() : string.Empty;
 
             MethodSignature<TypeRef> methodSig = funcDef.DecodeSignature(this.typeRefDecoder, null);
 
             Enforce.Data(methodSig.Header.Kind == SignatureKind.Method);
+
             // Enforce.Data(methodSig.Header.CallingConvention == SignatureCallingConvention.Default);
             if (kind == FuncKind.Fixed)
             {
@@ -1062,7 +1084,7 @@ namespace JsonWin32Generator
             if (kind == FuncKind.Fixed)
             {
                 writer.WriteLine(",\"DllImport\":\"{0}\"", importName);
-                writer.WriteLine(",\"EntryPoint\":\"{0}\"", this.mr.GetString(methodImport.Name));
+                writer.WriteLine(",\"EntryPoint\":\"{0}\"", reader.Reader.GetString(methodImport.Name));
                 writer.WriteLine(",\"CallingConvention\":\"{0}\"", callingConvention);
                 writer.WriteLine(",\"Constant\":{0}", constant.JsonString());
             }
@@ -1117,20 +1139,20 @@ namespace JsonWin32Generator
             writer.Tab();
             if (!funcPatch.Func.SkipParams)
             {
-                this.GenerateParams(writer, funcDef, funcPatch, methodSig);
+                this.GenerateParams(reader, writer, funcDef, funcPatch, methodSig);
             }
             writer.Untab();
             writer.WriteLine("]");
             return funcName;
         }
 
-        private void GenerateParams(TabWriter writer, MethodDefinition funcDef, FuncPatch funcPatch, MethodSignature<TypeRef> methodSig)
+        private void GenerateParams(ReaderInfo reader, TabWriter writer, MethodDefinition funcDef, FuncPatch funcPatch, MethodSignature<TypeRef> methodSig)
         {
             string paramFieldPrefix = string.Empty;
             int nextExpectedSequenceNumber = 1;
             foreach (ParameterHandle paramHandle in funcDef.GetParameters())
             {
-                Parameter param = this.mr.GetParameter(paramHandle);
+                Parameter param = reader.Reader.GetParameter(paramHandle);
                 if (param.SequenceNumber == 0)
                 {
                     // this is the return parameter
@@ -1162,7 +1184,7 @@ namespace JsonWin32Generator
                 bool @const = false;
                 foreach (CustomAttributeHandle attrHandle in param.GetCustomAttributes())
                 {
-                    CustomAttr attr = CustomAttr.Decode(this.mr, attrHandle);
+                    CustomAttr attr = CustomAttr.Decode(reader.Reader, attrHandle);
                     if (object.ReferenceEquals(attr, CustomAttr.Const.Instance))
                     {
                         @const = true; // set attribute below
@@ -1205,28 +1227,28 @@ namespace JsonWin32Generator
                     }
                     else if (attr is CustomAttr.AssociatedEnum)
                     {
-                        // nothing
+                        // TODO: do something with this
                     }
                     else if (attr is CustomAttr.Documentation)
                     {
-                        // nothing
+                        // TODO: do something with this
                     }
                     else if (attr is CustomAttr.RaiiFree rf)
                     {
-                        // nothing
+                        // TODO: do something with this
                     }
                     else if (attr is CustomAttr.IgnoreIfReturn)
                     {
-                        // nothing
+                        // TODO: do something with this
                     }
                     else
                     {
-                        Console.WriteLine("{0} ({1}) has unknown attribute {2}", this.mr.GetString(param.Name), this.mr.GetString(funcDef.Name), attr);
+                        Console.WriteLine("{0} ({1}) has unknown attribute {2}", reader.Reader.GetString(param.Name), reader.Reader.GetString(funcDef.Name), attr);
                         Violation.Data();
                     }
                 }
 
-                string paramName = this.mr.GetString(param.Name);
+                string paramName = reader.Reader.GetString(param.Name);
                 Enforce.Data(paramName.Length > 0);
 
                 if (funcPatch.ParamMap.TryGetValue(paramName, out ParamPatch? patch))
