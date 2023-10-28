@@ -382,9 +382,17 @@ namespace JsonWin32Generator
                 int endBrace = optionalConstant.Value.IndexOf("}", StringComparison.Ordinal);
                 bool endBraceAtEnd = (endBrace + 1) == optionalConstant.Value.Length;
                 var trimmed = optionalConstant.Value[1..endBrace];
-                var pid = endBraceAtEnd ? "null" : optionalConstant.Value[(endBrace + 3)..];
-                writer.WriteLine(",\"ValueType\":\"PropertyKey\"");
-                writer.WriteLine(",\"Value\":{{\"Fmtid\":\"{0}\",\"Pid\":{1}}}", trimmed, pid);
+                var pid = endBraceAtEnd ? null : optionalConstant.Value[(endBrace + 3)..];
+                if (pid != null)
+                {
+                    writer.WriteLine(",\"ValueType\":\"PropertyKey\"");
+                    writer.WriteLine(",\"Value\":{{\"Fmtid\":\"{0}\",\"Pid\":{1}}}", trimmed, pid);
+                }
+                else
+                {
+                    writer.WriteLine(",\"ValueType\":\"SID\"");
+                    writer.WriteLine(",\"Value\":[{0}]", trimmed);
+                }
             }
             else
             {
